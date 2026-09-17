@@ -76,3 +76,20 @@ npm run build
 ```
 
 The build writes straight into `web/dist`. Do not rename the output files in `vite.config.js` — the game caches the page and will load a blank dashboard if the names change.
+
+## Client export for shells/interiors
+
+Enable the local interior override when a player enters a shell. It affects only
+that player: time is held at 23:00, weather becomes clear immediately, and rain
+is removed. The synchronized server weather and time continue normally.
+
+```lua
+exports['ft_weathersystemv2']:SetInteriorOverride(true)
+```
+
+Disable it when the player leaves. A fresh authoritative state is requested
+from the server and normal synchronization resumes.
+
+```lua
+exports['ft_weathersystemv2']:SetInteriorOverride(false)
+```

@@ -8,6 +8,9 @@ local weatherInterval = Config.NewWeatherTimer
 local timeSpeed = Config.TimeSpeed or 1
 local isRealTimeSync = Config.RealTimeSync
 local syncDisabled = false
+local interiorOverride = false
+local weatherNeedsApply = true
+local weatherTransitionUntil = 0
 local isUIOpen = false
 local lastSentMinute = -1
 local lastSentHour = -1
@@ -29,7 +32,10 @@ CreateThread(function()
 end)
 
 RegisterNetEvent('ft_weathersystem:client:syncWeather', function(weather, blackout)
-    currentWeather = weather
+    if weather and weather ~= currentWeather then
+        currentWeather = weather
+        weatherNeedsApply = true
+    end
     isBlackout = blackout
 
     if isUIOpen then
@@ -46,13 +52,20 @@ RegisterNetEvent('ft_weathersystem:client:syncTime', function(serverSec, freeze,
     if speed then timeSpeed = speed end
     if realTime ~= nil then isRealTimeSync = realTime end
 
-    if snap or math.abs(currentSeconds - serverSec) > 120 then
-        currentSeconds = serverSec
+    -- The server is authoritative.  The old 120-second tolerance allowed every
+    -- client to run a noticeably different clock for long periods.  Correct on
+    -- every sync; the server broadcasts often enough that the adjustment is
+    -- only a few in-game seconds in normal conditions.
+    if type(serverSec) == 'number' then
+        currentSeconds = serverSec % 86400.0
     end
 end)
 
 RegisterNetEvent('ft_weathersystem:client:syncState', function(data)
-    if data.weather ~= nil then currentWeather = data.weather end
+    if data.weather ~= nil and data.weather ~= currentWeather then
+        currentWeather = data.weather
+        weatherNeedsApply = true
+    end
     if data.blackout ~= nil then isBlackout = data.blackout end
     if data.freezeTime ~= nil then isTimeFrozen = data.freezeTime end
     if data.dynamicWeather ~= nil then dynamicWeather = data.dynamicWeather end
@@ -74,6 +87,7 @@ end)
 
 RegisterNetEvent('ft_weathersystem:client:enableSync', function()
     syncDisabled = false
+    weatherNeedsApply = true
     TriggerServerEvent('ft_weathersystem:server:requestSync')
 end)
 
@@ -85,6 +99,24 @@ RegisterNetEvent('ft_weathersystem:client:disableSync', function()
     SetWeatherTypeNowPersist('CLEAR')
     NetworkOverrideClockTime(18, 0, 0)
 end)
+
+local function setInteriorOverride(enabled)
+    interiorOverride = enabled == true
+    weatherNeedsApply = true
+
+    if not interiorOverride then
+        -- Pull a fresh snapshot instead of restoring possibly stale local state.
+        TriggerServerEvent('ft_weathersystem:server:requestSync')
+    end
+
+    return interiorOverride
+end
+
+-- Client-only shell/interior mode. While enabled, only this player sees clear
+-- weather at night; the server weather keeps progressing for everyone else.
+-- Usage: exports['ft_weathersystemv2']:SetInteriorOverride(true/false)
+exports('SetInteriorOverride', setInteriorOverride)
+exports('setInteriorOverride', setInteriorOverride)
 
 RegisterNetEvent('ft_weathersystem:client:openUI', function(data)
     isUIOpen = true
@@ -164,38 +196,40 @@ end)
 
 CreateThread(function()
     while true do
-        if not syncDisabled then
-            if lastWeather ~= currentWeather then
-                lastWeather = currentWeather
-                SetWeatherTypeOverTime(currentWeather, 15.0)
-                Wait(15000)
-            end
-
-            Wait(100)
-            SetArtificialLightsState(isBlackout)
-            SetArtificialLightsStateAffectsVehicles(Config.BlackoutVehicle)
-            ClearOverrideWeather()
-            ClearWeatherTypePersist()
-            SetWeatherTypePersist(lastWeather)
-            SetWeatherTypeNow(lastWeather)
-            SetWeatherTypeNowPersist(lastWeather)
-
-            if lastWeather == 'XMAS' then
-                SetForceVehicleTrails(true)
-                SetForcePedFootstepsTracks(true)
-            else
-                SetForceVehicleTrails(false)
-                SetForcePedFootstepsTracks(false)
-            end
-
-            if lastWeather == 'RAIN' then
-                SetRainLevel(0.3)
-            elseif lastWeather == 'THUNDER' then
-                SetRainLevel(0.5)
-            else
-                SetRainLevel(0.0)
-            end
+        if syncDisabled then
+            Wait(1000)
         else
+            local targetWeather = interiorOverride and 'CLEAR' or currentWeather
+
+            if weatherNeedsApply or lastWeather ~= targetWeather then
+                weatherNeedsApply = false
+                lastWeather = targetWeather
+
+                ClearOverrideWeather()
+                ClearWeatherTypePersist()
+
+                if interiorOverride then
+                    weatherTransitionUntil = 0
+                    SetWeatherTypePersist('CLEAR')
+                    SetWeatherTypeNow('CLEAR')
+                    SetWeatherTypeNowPersist('CLEAR')
+                else
+                    SetWeatherTypeOverTime(targetWeather, 8.0)
+                    weatherTransitionUntil = GetGameTimer() + 8000
+                end
+            end
+
+            -- Reassert without clearing first. Clearing persistent weather on
+            -- every pass briefly hands control back to GTA and causes flashes.
+            SetWeatherTypePersist(targetWeather)
+            if interiorOverride or GetGameTimer() >= weatherTransitionUntil then
+                SetWeatherTypeNowPersist(targetWeather)
+            end
+
+            local snow = targetWeather == 'XMAS'
+            SetForceVehicleTrails(snow)
+            SetForcePedFootstepsTracks(snow)
+
             Wait(1000)
         end
     end
@@ -211,17 +245,30 @@ CreateThread(function()
         lastGameTime = now
 
         if not syncDisabled then
-            if not isTimeFrozen then
+            if not interiorOverride and not isTimeFrozen then
                 local rate = isRealTimeSync and 1.0 or (30.0 * (timeSpeed or 1))
                 currentSeconds = (currentSeconds + (dt * rate)) % 86400.0
             end
 
-            local totalSec = math.floor(currentSeconds)
+            local totalSec = interiorOverride and (23 * 3600) or math.floor(currentSeconds)
             local hour = math.floor(totalSec / 3600) % 24
             local minute = math.floor((totalSec % 3600) / 60)
             local second = totalSec % 60
 
+            -- These natives can be reset by GTA every frame. Applying them
+            -- together prevents one-frame day/night and blackout flashes.
             NetworkOverrideClockTime(hour, minute, second)
+            SetArtificialLightsState(interiorOverride and false or isBlackout)
+            SetArtificialLightsStateAffectsVehicles(Config.BlackoutVehicle)
+
+            local activeWeather = interiorOverride and 'CLEAR' or currentWeather
+            if activeWeather == 'RAIN' then
+                SetRainLevel(0.3)
+            elseif activeWeather == 'THUNDER' then
+                SetRainLevel(0.5)
+            else
+                SetRainLevel(0.0)
+            end
 
             if isUIOpen and (minute ~= lastSentMinute or hour ~= lastSentHour) then
                 lastSentMinute = minute
